@@ -1,0 +1,773 @@
+---
+title: "Identifying and Understanding key factors of sexual and reproductive health for Chinese female college students"
+author: "Zongchao Liu; Zhi Lin"
+date: "1/10/2021"
+output: 
+  html_document:
+          toc: true 
+          toc_float: true
+          code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(arsenal)
+library(knitr)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(caret)
+library(ranger)
+library(lime)
+options(java.parameters = "-Xmx2500m")
+library(bartMachine)
+library(gplots)
+library(factoextra)
+library(pROC)
+library(ResourceSelection)
+library(conflicted)
+conflict_prefer("select", "dplyr", "MASS")
+conflict_prefer("filter", "dplyr", "stats")
+conflict_prefer("rename", "dplyr")
+```
+
+# Intro
+
+This report is the second project for a SRH project. The main goal of this project is to identify and understand key factors of adverse outcomes for Chinese female college students who are considered to be sexually active.
+
+# Import & cleaning data
+
+```{r message=FALSE, warning=FALSE}
+NCSS_SRH = read_csv('./data/2020NCSS-SRH_0228cleaned.csv')
+var_names = names(NCSS_SRH) %>% as.tibble()
+
+attitude = NCSS_SRH %>%
+  filter(!is.na(`B24.避孕措施使用频率code`)) %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  select(15, seq(133, 155, 2)) 
+  #filter(`P6.生理性别code` == 0)
+
+att_list = names(attitude)
+names(attitude[,-1]) = c("x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12")
+
+awareness = NCSS_SRH %>%
+  select(14,70,242,111,113:121)
+
+harass = NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(1,389:395) %>%
+  mutate(`B43.(性骚扰)因身体发育被同学嘲笑(可多选)` = ifelse(str_detect( `B43.(性骚扰)因身体发育被同学嘲笑(可多选)`, "上大学"), 1, 0),
+         `B43.(性骚扰)在现实生活中受到言语上的性骚扰(可多选)` = ifelse(str_detect( `B43.(性骚扰)在现实生活中受到言语上的性骚扰(可多选)`,"上大学"), 1, 0),
+         `B43.(性骚扰)在网上或手机上受到言语上的性骚扰(可多选)` = ifelse(str_detect(`B43.(性骚扰)在网上或手机上受到言语上的性骚扰(可多选)`,"上大学"), 1, 0),
+         `B43.(性侵害)强迫脱衣/暴露隐私部位(可多选)` = ifelse(str_detect(`B43.(性侵害)强迫脱衣/暴露隐私部位(可多选)`,"上大学"), 1, 0),
+         `B43.(性侵害)强迫亲吻或触摸隐私部位(可多选)` = ifelse(str_detect(`B43.(性侵害)强迫亲吻或触摸隐私部位(可多选)`,"上大学"), 1, 0),
+         `B43.(性侵害)强迫口交(可多选)` = ifelse(str_detect( `B43.(性侵害)强迫口交(可多选)`,"上大学"), 1, 0),
+         `B43.(性侵害)强迫性交(阴道/肛门)(可多选)` = ifelse(str_detect( `B43.(性侵害)强迫性交(阴道/肛门)(可多选)`,"上大学"), 1, 0))
+
+colSums(harass[,-1])
+sum(rowSums(harass[,-1]) != 0)
+
+outcomes = NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(1, 274, 388, 511) %>%
+  rename("contraceptive_freq" = "B24.避孕措施使用频率code",
+         "std" = "B42.是否确诊过性病",
+         "depression" = "C10.抑郁量表CES-D-10总分(≥10可认为有抑郁症状)") %>%
+  mutate(contraceptive_freq = as.numeric(contraceptive_freq),
+         contraceptive_freq = case_when(contraceptive_freq == 5 ~ 3,
+                                         contraceptive_freq == 4 ~ 2,
+                                        contraceptive_freq == 3 | contraceptive_freq == 2 | contraceptive_freq == 1 ~ 1),
+         depression = factor(ifelse(depression >= 10, 1, 0)),
+         harass = factor(ifelse(rowSums(harass[,-1]) != 0, 1, 0))) %>%
+  #mutate(pregnant = ifelse(is.na(pregnant), 0, pregnant)) %>%
+  rename("key" = "序号")
+
+# colSums(outcomes)
+p = NCSS_SRH[,273:274] %>% na.omit()
+p %>% filter(`B24.避孕措施使用频率code` == 2)
+sum(p[,2] == 5)
+sum(p[,2] == 4)
+sum(p[,2] == 3)
+sum(p[,2] == 2)
+sum(p[,2] == 1)
+```
+
+## Outcomes
+
+In total, we have 6968 recored subjects who have hookup experience.
+
+```{r}
+head(outcomes) %>% kable()
+```
+
+
+The adverse outcomes we define here include:
+
+- unwanted pregnancy: Among the 2199 subjects, we have `r sum(outcomes$pregnant == 1)` subjects who have the outcome of unwanted pregnancy
+
+- STD: Among the 2199 subjects, we have `r sum(outcomes$STD == 1)` subjects who have the outcome of STD
+
+- Sexual assault: Among the 2199 subjects, we have `r sum(rowSums(harass[,-1]) != 0)` subjects who have the outcome of Sexual assault
+
+- Depression: Among the 2199 subjects, we have `r sum(outcomes$depression.y == 1)` subjects who have the outcome of depression
+
+## Covariates
+
+- School related:
+
+location, school type, undergraduate, enrollment year, education level(index: `7,8,9,11,12,13`)
+
+```{r}
+school = NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  select(15,1,7,8,9,11,12,13) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(-1)
+```
+
+
+- SES
+
+sex, age, expectation for marriage, expenditure, romantic relationship, father/mother's education level*, smoking, alcohol consumption, single child, area, divorced family
+
+```{r}
+demographics = NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(c(1,14,19,38,519,159,534,536,469,467,131,242,533,511,525, 556)) %>% # 242 indicates sexual com
+  rename(expenditure =`D4.过去12个月平均每月支出(元,不含学校规定缴费项目)`,
+         age = `实足年龄(周岁,取整)`,
+         divorce = `D16.家中是否发生过父母离异`) %>%
+  mutate(expenditure = case_when(expenditure <= 1500 ~ "<1500",
+                                 expenditure <= 2500 & expenditure > 1500 ~ "1500~2500",
+                                 expenditure > 2500 ~ ">2500"),
+         #age = case_when(age < 20 ~"<20",
+         #                age >=20 & age<= 21 ~ "21~22",
+         #                age > 22 ~ ">22"),
+         divorce = factor(divorce))
+```
+
+- Attitudes
+
+we synthesized 12 questions
+
+```{r}
+attitude = attitude[,-1]
+#attitude[attitude == 1 | attitude == 2] = -1
+#attitude[attitude == 3 ] = 0
+#attitude[attitude == 4 | attitude == 5] = 1
+hclust.complete = hclust(dist(attitude[,-1]), method = "complete")
+plot(hclust.complete)
+ind3.complete = cutree(hclust.complete, 3)
+```
+
+
+- Awareness(SRH knowledge) 
+
+Initially we can use the SRH score for predicting the outcomes
+
+```{r}
+awareness = NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(1,131) %>%
+  rename("score" = "A16.性知识得分(满分9)")
+```
+
+- Contraceptive
+
+The person who determine the contraceptive use; Accessibility; free access
+
+indices are: `326, 328, 330(331)`
+
+```{r}
+contraceptive = 
+  NCSS_SRH %>%
+  filter(`B7.是否发生过插入式性行为(阴道/肛门)` == 1 ) %>%
+  #filter(`P6.生理性别code` == 0) %>%
+  select(1,325, 327, 331)
+  
+unique(contraceptive$pdeter)
+unique(contraceptive$accessibility)
+names(contraceptive) = c("key", "pdeter", "accessibility", "freeacc")
+
+contraceptive = contraceptive %>%
+  mutate(accessibility = factor(ifelse(str_detect(accessibility, "不"), 0, 1)),
+         freeacc = factor(freeacc)) %>%
+  filter(!str_detect(pdeter, "其他"))
+```
+
+
+Combined covariates: 
+
+```{r}
+covariates = left_join(left_join(school, demographics),awareness) %>% rename("key" = "序号")
+names(covariates) = c("key", "location", "schlevl","schtype","degree","undergrad","enrllyr","sex","age","marriage","expenditure","relationship","fedu","medu","smoking","drink","srh_score", "hookup", "single","depression", "area", "divorce", "score")
+```
+
+
+
+# General Workflow
+
+- feature engineering
+
+```{r}
+features = covariates %>% 
+  mutate(location = case_when(location == 1 ~ "east",
+                              location == 2 ~ "middle",
+                              location == 3 ~ "west"),
+         schlevl = case_when(schlevl == "本科" ~ "univ",
+                             schlevl == "专科" ~ "vocational"),
+         schlevl = factor(schlevl, levels = c("vocational", "univ")),
+         degree = factor(degree),
+         undergrad = factor(undergrad),
+         enrllyr = enrllyr - 2015,
+         sex = case_when(sex == "男" ~ "male",
+                         sex == "女" ~ "female"),
+         marriage = as.character(marriage),
+         expenditure = factor(expenditure, levels = c("<1500", "1500~2500", ">2500")),
+         expenditure = case_when(expenditure == "<1500" ~ 0,
+                                 expenditure == "1500~2500" ~ 1,
+                                 expenditure == ">2500" ~ 2),
+         drink = factor(drink),
+         single = factor(single),
+         fedu = case_when(str_detect(fedu, "大学") ~ "bachelor",
+                          str_detect(fedu, "硕士") ~ "master+",
+                          !str_detect(fedu, "大学") & !str_detect(fedu, "硕士") ~ "lower"),
+         medu = case_when(str_detect(medu, "大学") ~ "bachelor",
+                          str_detect(medu, "硕士") ~ "master+",
+                          !str_detect(medu, "大学") & !str_detect(medu, "硕士") ~ "lower"),
+         fedu = factor(fedu, levels = c("lower", "bachelor", "master+")),
+         medu = factor(fedu, levels = c("lower", "bachelor", "master+")),
+         area = case_when(area == "农村" ~ "rural",
+                          area == "城市" ~ "urban",
+                          area == "县城(乡镇、郊区)" ~ "suburban"),
+         relationship = case_when(relationship == "目前单身(恋爱过)" ~ "2",
+                                  relationship == "有男/女朋友(及已婚)" ~ "3",
+                                  relationship == "一直单身" ~ "1"
+                                  ),
+         smoking = case_when(smoking == "从不吸烟" ~ "1",
+                             smoking == "过去吸烟，但目前已不抽" ~ "2",
+                             smoking == "现在吸烟" ~ "3")
+         
+         ) %>%
+  select(-srh_score, -hookup, -schtype)
+```
+
+- Combine targets with features
+
+```{r}
+df = features %>%
+  cbind(., ind3.complete) %>%
+  rename(attitude = ind3.complete) %>%
+  left_join(., outcomes, by = "key") %>%
+  left_join(., contraceptive, by = "key") %>%
+  select(-1) %>%
+  select(everything(), contraceptive_freq, std, depression.y, harass)
+```
+
+
+- Generate specific datasets for each outcome
+
+```{r}
+contraceptive_pred = df %>% na.omit() %>%
+  mutate(pdeter = case_when(pdeter == "自己" ~ "1",
+                            pdeter == "对方" ~ "4",
+                            pdeter == "双方协商" ~ "2",
+                            pdeter == "说不好谁来决定，看情况" | pdeter == "看手头有什么就用什么" ~ "3")) %>%
+  filter(age > 11 & age < 30)
+  
+#std_pred = df[,-c(21,23,24)] %>% na.omit()
+#depression_pred = df[,-c(21,22,24)] %>% na.omit()
+#harass_pred = df[,-c(21:23)] %>% na.omit()
+
+```
+
+
+# Unwanted pregnancy
+
+## split original data
+
+```{r}
+#down sampling
+t = contraceptive_pred %>% mutate(contraceptive_freq = factor(contraceptive_freq))
+down_df = downSample(t, t$contraceptive_freq) %>% mutate(contraceptive_freq = as.numeric(contraceptive_freq)) %>% select(-Class)
+contraceptive_pred = down_df %>% mutate(attitude = as.character(attitude),
+                                        contraceptive_freq = case_when(contraceptive_freq == 1 ~ "low",
+            contraceptive_freq == 2 ~ "middle",
+            contraceptive_freq == 3 ~"high"),
+            contraceptive_freq = factor(contraceptive_freq, levels = c("low","middle","high"))) %>%
+  mutate(contraceptive_freq = as.numeric(contraceptive_freq)) 
+# %>% mutate(contraceptive_freq = scale(contraceptive_freq, scale = T))
+  
+
+set.seed(123)
+trRow = createDataPartition(y = contraceptive_pred$contraceptive_freq, p = 0.7)$Resample1
+```
+
+
+## pregnacy - training
+
+```{r}
+x = model.matrix(contraceptive_freq ~ . , contraceptive_pred)[,-1] %>% as.tibble() %>%
+  as.matrix() %>% .[trRow, ]
+x.lasso.test = model.matrix(contraceptive_freq ~ . , contraceptive_pred)[,-1] %>% as.tibble() %>%
+  as.matrix() %>% .[-trRow, ]
+y = contraceptive_pred$contraceptive_freq[trRow]
+
+#check dim
+dim(x)
+length(y)
+
+ctrl = trainControl(method = "cv", number = 5,
+                    classProbs = F,
+                    #summaryFunction = twoClassSummary,
+                    #sampling = "up"
+                    )
+
+##lr
+#lr.fit = train(x = contraceptive_pred[trRow,-21], # rm std
+#                y = contraceptive_pred$contraceptive_freq[trRow],
+#                method = "glm",
+#                #metric = "ROC",
+#                trControl = ctrl
+#                ) 
+#
+##lasso
+#lasso.fit = train(x,y,
+#                method = "glmnet",
+#                #metric = "ROC",
+#                tuneGrid = expand.grid(alpha = 1,lambda = exp(seq(-7, -6, length #= 100))),
+#                trControl = ctrl)
+
+#ggplot(lasso.fit, highlight = T) +
+#  labs(title = "LASSO tuning procedure") +
+#  theme_bw()
+
+# rf
+set.seed(123)
+rf.grid = expand.grid(mtry = 12:17,
+                      splitrule = "variance",
+                      min.node.size = c(100,150,200)
+                      )
+rf.fit = train(contraceptive_freq ~ ., contraceptive_pred[trRow,], 
+                method = "ranger",
+                tuneGrid = rf.grid,
+                #metric = "ROC",
+                trControl = ctrl)
+ggplot(rf.fit, highlight = T)  +
+  labs(title = "RF tuning procedure") +
+  theme_bw()
+
+# Adaboost 
+gbmA.grid = expand.grid(n.trees = c(50,75,100),
+                        interaction.depth = 1:10,
+                        shrinkage = c(0.1),
+                        n.minobsinnode = c(100,150,200))
+
+
+set.seed(123)
+gbmA.fit = train(contraceptive_freq ~ ., contraceptive_pred[trRow,],
+                 tuneGrid = gbmA.grid,
+                 trControl = ctrl,
+                 method = "gbm",
+                 distribution = "gaussian",
+                 #metric = "ROC",
+                 verbose = T)
+gbmA.fit$bestTune 
+ggplot(gbmA.fit, highlight = T) +
+    labs(title = "GBM tuning procedure") +
+  theme_bw()
+
+
+set.seed(123)
+rf.final = ranger(contraceptive_freq ~ ., 
+                  contraceptive_pred[trRow,], 
+                  mtry = rf.fit$bestTune$mtry, 
+                  splitrule = "variance",
+                  min.node.size = rf.fit$bestTune$min.node.size,
+                  importance = "impurity")
+
+# var importance
+vip::vip(rf.final,num_features = 23) + theme_bw() + ggtitle("Variable Importance - RF")
+vip::vip(gbmA.fit$finalModel,num_features = 23) + theme_bw() + ggtitle("Variable Importance - GBM")
+
+
+#bart
+set.seed(123)
+x.bart = contraceptive_pred[trRow,-21] %>% as.data.frame()
+x.bart.test = contraceptive_pred[-trRow,-21] %>% as.data.frame()
+
+y.bart = as.integer(contraceptive_pred$contraceptive_freq[trRow])
+bart.fit.cv = bartMachineCV(X = x.bart,y = y.bart, k_cvs = 5, verbose = T, num_tree_cvs = c(50,100))
+
+#bart.fit = build_bart_machine(X = x.bart, 
+#                             y = y.bart,
+#                             num_trees = 150, 
+#                             num_burn_in = 200,
+#                             num_iterations_after_burn_in = 800)
+
+
+```
+
+
+```{r}
+############### training auc
+#lr.fit.pred = predict(lr.fit,newdata = contraceptive_pred[trRow,-c(21)])
+#sum(lr.fit.pred == contraceptive_pred$contraceptive_freq[trRow])/length(lr.fit.pred)
+
+#lasso.fit.pred = predict(lasso.fit,newdata = x)
+#sum(lasso.fit.pred == #contraceptive_pred$contraceptive_freq[trRow])/length(lasso.fit.pred)
+
+rf.fit.pred = predict(rf.fit,newdata = contraceptive_pred[trRow,-c(21)])
+sum(rf.fit.pred == contraceptive_pred$contraceptive_freq[trRow])/length(rf.fit.pred)
+rf_res_train = tibble(pred = as.numeric(rf.fit.pred), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+rf_training_err = sqrt(mean((rf_res_train$true - rf_res_train$pred)^2))
+
+gbmA.fit.pred = predict(gbmA.fit,newdata = contraceptive_pred[trRow,-c(21)])
+gbm_res_train = tibble(pred = as.numeric(gbmA.fit.pred), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+gbm_training_err = sqrt(mean((gbm_res_train$true - gbm_res_train$pred)^2))
+
+bart.fit.pred = predict(bart.fit.cv,new_data = x.bart)
+bart_res_train = tibble(pred = as.numeric(bart.fit.pred), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+bart_training_err = sqrt(mean((bart_res_train$true - bart_res_train$pred)^2))
+
+
+############### testing auc
+
+#lr.fit.test.pred = predict(lr.fit,newdata = contraceptive_pred[-trRow,-c(21)])
+#sum(lr.fit.test.pred == contraceptive_pred$contraceptive_freq[-trRow])/length(lr.fit.test.pred)
+
+#lasso.fit.test.pred = predict(lasso.fit,newdata = x.lasso.test)
+#sum(lasso.fit.test.pred == contraceptive_pred$contraceptive_freq[-trRow])/length(lasso.fit.test.pred)
+
+rf.fit.test.pred = predict(rf.fit,newdata = contraceptive_pred[-trRow,-c(21)])
+rf_res_test = tibble(pred = as.numeric(rf.fit.test.pred), true = as.numeric(contraceptive_pred$contraceptive_freq[-trRow]))
+rf_test_err = sqrt(mean((rf_res_test$true - rf_res_test$pred)^2))
+
+
+gbmA.fit.test.pred = predict(gbmA.fit,newdata = contraceptive_pred[-trRow,-c(21)])
+gbm_res_test = tibble(pred = as.numeric(gbmA.fit.test.pred), true = as.numeric(contraceptive_pred$contraceptive_freq[-trRow]))
+gbm_test_err = sqrt(mean((gbm_res_test$true - gbm_res_test$pred)^2))
+
+bart.fit.test.pred = predict(bart.fit.cv,new_data = x.bart.test)
+bart_res_test = tibble(pred = as.numeric(bart.fit.test.pred, digits = 1), true = as.numeric(contraceptive_pred$contraceptive_freq[-trRow]))
+bart_test_err = sqrt(mean((bart_res_test$true - bart_res_test$pred)^2))
+```
+
+# get bart ranking 
+
+```{r}
+props = get_var_props_over_chain(bart.fit.cv) %>% as.data.frame() %>% arrange(desc(.)) %>% rename("prop" = ".") %>% mutate(names = rownames(.))
+
+investigate_var_importance(bart.fit.cv, num_replicates_for_avg = 3)
+
+plot_convergence_diagnostics(bart.fit.cv)
+
+
+#summary(lm(bart.fit.test.pred ~ true, data = res_1))
+
+rf_coefs = coef(lm(pred ~ true, data = rf_res_test))
+gbm_coefs = coef(lm(pred ~ true, data = gbm_res_test))
+bart_coefs = coef(lm(pred ~ true, data = bart_res_test))
+
+summary(lm(pred ~ true, data = rf_res_test))
+summary(lm(pred ~ true, data = gbm_res_test))
+summary(lm(pred ~ true, data = bart_res_test))
+
+rf_res_test%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = rf_coefs[1], slope = rf_coefs[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+
+gbm_res_test%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = gbm_coefs[1], slope = gbm_coefs[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+
+bart_res_test%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = bart_coefs[1], slope = bart_coefs[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+
+mean(rf_res_test$pred)
+mean(gbm_res_test$pred)
+mean(bart_res_test$pred)
+#
+#t.test(res[res$true == 1,][,1], res[res$true == 2,][,1])
+#t.test(res[res$true == 2,][,1], res[res$true == 3,][,1])
+
+
+```
+
+# Same models but 10 variables
+
+```{r}
+contraceptive_pred_new = contraceptive_pred %>%
+  dplyr::select(pdeter, score, depression.x, attitude, enrllyr, marriage, accessibility, single, freeacc, degree, smoking, relationship, drink, contraceptive_freq)
+
+contraceptive_pred_new.male = contraceptive_pred %>%
+  filter(sex == "male") %>%
+  dplyr::select(pdeter, score, depression.x, attitude, enrllyr, marriage, accessibility, single, freeacc, degree, smoking, relationship, drink, contraceptive_freq)
+
+contraceptive_pred_new.female = contraceptive_pred %>%
+  filter(sex == "female") %>%
+  dplyr::select(pdeter, score, depression.x, attitude, enrllyr, marriage, accessibility, single, freeacc, degree, smoking, relationship, drink, contraceptive_freq)
+
+
+x = model.matrix(contraceptive_freq ~ . , contraceptive_pred_new)[,-1] %>% as.tibble() %>%
+  as.matrix() %>% .[trRow, ]
+x.lasso.test = model.matrix(contraceptive_freq ~ . , contraceptive_pred_new)[,-1] %>% as.tibble() %>%
+  as.matrix() %>% .[-trRow, ]
+y = contraceptive_pred_new$contraceptive_freq[trRow]
+
+#check dim
+dim(x)
+length(y)
+
+ctrl = trainControl(method = "cv", number = 5,
+                    classProbs = F,
+                    #summaryFunction = twoClassSummary,
+                    #sampling = "up"
+                    )
+
+#lr
+#set.seed(123)
+#lr.fit_new = train(x = contraceptive_pred_new[trRow,-16], # rm std
+#                y = contraceptive_pred_new$contraceptive_freq[trRow],
+#                method = "glm",
+#                #metric = "ROC",
+#                trControl = ctrl
+#                ) 
+#
+##lasso
+#lasso.fit_new = train(x,y,
+#                method = "glmnet",
+#                #metric = "ROC",
+#                tuneGrid = expand.grid(alpha = 1,lambda = exp(seq(-7, -6, length #= 100))),
+#                trControl = ctrl)
+#
+#ggplot(lasso.fit_new, highlight = T) +
+#  labs(title = "LASSO tuning procedure") +
+#  theme_bw()
+
+# rf
+set.seed(123)
+rf.grid_new = expand.grid(mtry = 2:7,
+                      splitrule = "variance",
+                      min.node.size = c(100,150,200)
+                      )
+rf.fit_new = train(contraceptive_freq ~ ., contraceptive_pred_new[trRow,], 
+                method = "ranger",
+                tuneGrid = rf.grid,
+                #metric = "ROC",
+                trControl = ctrl)
+ggplot(rf.fit_new, highlight = T)  +
+  labs(title = "RF tuning procedure") +
+  theme_bw()
+
+# Adaboost 
+gbmA.grid_new = expand.grid(n.trees = c(100,150,200),
+                        interaction.depth = 2:5,
+                        shrinkage = c(0.1),
+                        n.minobsinnode = c(50,75))
+
+
+set.seed(123)
+gbmA.fit_new = train(contraceptive_freq ~ ., contraceptive_pred_new[trRow,],
+                 tuneGrid = gbmA.grid,
+                 trControl = ctrl,
+                 method = "gbm",
+                 distribution = "gaussian",
+                 #metric = "ROC",
+                 verbose = T)
+gbmA.fit$bestTune 
+ggplot(gbmA.fit_new, highlight = T) +
+    labs(title = "GBM tuning procedure") +
+  theme_bw()
+
+
+set.seed(123)
+rf.final_new = ranger(contraceptive_freq ~ ., 
+                  contraceptive_pred_new[trRow,], 
+                  mtry = rf.fit_new$bestTune$mtry, 
+                  splitrule = "variance",
+                  min.node.size = rf.fit_new$bestTune$min.node.size,
+                  importance = "impurity")
+
+# var importance
+vip::vip(rf.final_new,num_features = 23) + theme_bw() + ggtitle("Variable Importance - RF")
+vip::vip(gbmA.fit_new$finalModel,num_features = 23) + theme_bw() + ggtitle("Variable Importance - GBM")
+
+
+#bart
+x.bart_new = contraceptive_pred_new[trRow,-14] %>% as.data.frame()
+x.bart.test_new = contraceptive_pred_new[-trRow,-14] %>% as.data.frame()
+set.seed(123)
+y.bart_new = as.numeric(contraceptive_pred_new$contraceptive_freq[trRow])
+bart.fit.cv_new = bartMachineCV(X = x.bart_new, y = y.bart_new, k_cvs = 5, verbose = T, num_tree_cvs = c(50,100))
+```
+
+#RMSE - 8 variables
+
+```{r}
+############### training RMSE
+rf.fit.pred_new = predict(rf.fit_new,newdata = contraceptive_pred_new[trRow,-c(14)])
+sum(rf.fit.pred_new == contraceptive_pred$contraceptive_freq[trRow])/length(rf.fit.pred)
+rf_res_train_new = tibble(pred = as.numeric(rf.fit.pred_new), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+rf_training_err_new = sqrt(mean((rf_res_train_new$true - rf_res_train_new$pred)^2))
+
+gbmA.fit.pred_new = predict(gbmA.fit_new,newdata = contraceptive_pred_new[trRow,-c(14)])
+gbm_res_train_new = tibble(pred = as.numeric(gbmA.fit.pred_new), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+gbm_training_err_new = sqrt(mean((gbm_res_train_new$true - gbm_res_train_new$pred)^2))
+
+bart.fit.pred_new = predict(bart.fit.cv_new,new_data = x.bart_new)
+bart_res_train_new = tibble(pred = as.numeric(bart.fit.pred_new), true = as.numeric(contraceptive_pred$contraceptive_freq[trRow]))
+bart_training_err_new = sqrt(mean((bart_res_train_new$true - bart_res_train_new$pred)^2))
+
+
+############### testing aRMSE
+
+rf.fit.test.pred_new = predict(rf.fit_new,newdata = contraceptive_pred_new[-trRow,-c(14)])
+rf_res_test_new = tibble(pred = as.numeric(rf.fit.test.pred_new), true = as.numeric(contraceptive_pred_new$contraceptive_freq[-trRow]))
+rf_test_err_new = sqrt(mean((rf_res_test_new$true - rf_res_test_new$pred)^2))
+
+
+gbmA.fit.test.pred_new = predict(gbmA.fit_new,newdata = contraceptive_pred_new[-trRow,-c(14)])
+gbm_res_test_new = tibble(pred = as.numeric(gbmA.fit.test.pred_new), true = as.numeric(contraceptive_pred_new$contraceptive_freq[-trRow]))
+gbm_test_err_new = sqrt(mean((gbm_res_test_new$true - gbm_res_test_new$pred)^2))
+
+bart.fit.test.pred_new = predict(bart.fit.cv_new,new_data = x.bart.test_new)
+bart_res_test_new = tibble(pred = as.numeric(bart.fit.test.pred_new, digits = 1), true = as.numeric(contraceptive_pred_new$contraceptive_freq[-trRow]))
+bart_test_err_new = sqrt(mean((bart_res_test_new$true - bart_res_test_new$pred)^2))
+
+# summary
+## full var training err
+training_err = c(rf_training_err, gbm_training_err, bart_training_err)
+test_err = c(rf_test_err, gbm_test_err, bart_test_err)
+res = rbind(training_err,test_err)
+colnames(res) = c("rf", "gbm", "bart")
+
+
+
+## 8 var training err
+training_err_new = c(rf_training_err_new, gbm_training_err_new, bart_training_err_new)
+test_err_new = c(rf_test_err_new, gbm_test_err_new, bart_test_err_new)
+res_new = rbind(training_err_new,test_err_new)
+colnames(res_new) = c("rf", "gbm", "bart")
+
+
+res
+res_new 
+
+
+```
+
+
+# check - 8 variables
+
+```{r}
+rf_coefs_new = coef(lm(pred ~ true, data = rf_res_test_new))
+gbm_coefs_new = coef(lm(pred ~ true, data = gbm_res_test_new))
+bart_coefs_new = coef(lm(pred ~ true, data = bart_res_test_new))
+summary(lm(pred ~ true, data = rf_res_test_new))
+summary(lm(pred ~ true, data = gbm_res_test_new))
+summary(lm(pred ~ true, data = bart_res_test_new))
+
+rf_res_test_new%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = rf_coefs_new[1], slope = rf_coefs_new[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+
+gbm_res_test_new%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = gbm_coefs_new[1], slope = gbm_coefs_new[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+
+bart_res_test_new%>% ggplot(aes(x = true, y = pred, fill = factor(true))) +
+  geom_abline(intercept = bart_coefs_new[1], slope = bart_coefs_new[2], color = "blue") +
+  geom_boxplot(alpha = .6) + theme_bw() +
+  labs(title = "predicted vs actual value") +
+  ggsci::scale_fill_lancet()
+```
+
+
+# ordinal logistic
+
+```{r}
+library(MASS)
+library(generalhoslem)
+
+set.seed(123)
+contraceptive_pred_new = contraceptive_pred_new %>% mutate(contraceptive_freq = factor(contraceptive_freq))
+contraceptive.polr=polr(contraceptive_freq~ .,data = contraceptive_pred_new)
+summary(contraceptive.polr)
+lipsitz.test(contraceptive.polr)
+
+# stratified by sex
+## male
+contraceptive_pred_new.male = contraceptive_pred_new.male %>% mutate(contraceptive_freq = factor(contraceptive_freq))
+contraceptive.polr.male=polr(contraceptive_freq~ .,data = contraceptive_pred_new.male)
+summary(contraceptive.polr.male)
+#lipsitz.test(contraceptive.polr,female)
+ 
+## female
+contraceptive_pred_new.female = contraceptive_pred_new.female %>% mutate(contraceptive_freq = factor(contraceptive_freq))
+contraceptive.polr.female=polr(contraceptive_freq~ .,data = contraceptive_pred_new.female)
+summary(contraceptive.polr.female)
+#lipsitz.test(contraceptive.polr,female)
+
+# model prediction
+polr.predict.response = predict(contraceptive.polr,contraceptive_pred_new,type= 'class')
+
+
+# get final table results
+## male
+plor.table.male = summary(contraceptive.polr.male)$coefficients
+p = pnorm(abs(plor.table.male[, "t value"]), lower.tail = FALSE) * 2
+OR_point.est = exp(plor.table.male[,1])
+OR_ci = exp(c(plor.table.male[,1] - 1.96 * plor.table.male[,2], plor.table.male[,1] + 1.96 * plor.table.male[,2]))
+OR_ci_low = OR_ci[1:24]
+OR_ci_up = OR_ci[25:48]
+
+plor.table.male = cbind(plor.table.male, "p value" = p)
+plor.table.male = cbind(plor.table.male, "point est" = OR_point.est)
+plor.table.male = cbind(plor.table.male, "CI_low" = OR_ci_low)
+plor.table.male = cbind(plor.table.male, "CI_up" = OR_ci_up)
+
+
+# intercept
+intercept = plor.table.male[-c(1:(nrow(plor.table.male)-2)),]
+# final or
+write.csv(plor.table.male, "./proportional_odds_male.csv")
+
+
+
+## female
+
+plor.table.female = summary(contraceptive.polr.female)$coefficients
+p = pnorm(abs(plor.table.female[, "t value"]), lower.tail = FALSE) * 2
+OR_point.est = exp(plor.table.female[,1])
+OR_ci = exp(c(plor.table.female[,1] - 1.96 * plor.table.female[,2], plor.table.female[,1] + 1.96 * plor.table.female[,2]))
+OR_ci_low = OR_ci[1:24]
+OR_ci_up = OR_ci[25:48]
+
+plor.table.female = cbind(plor.table.female, "p value" = p)
+plor.table.female = cbind(plor.table.female, "point est" = OR_point.est)
+plor.table.female = cbind(plor.table.female, "CI_low" = OR_ci_low)
+plor.table.female = cbind(plor.table.female, "CI_up" = OR_ci_up)
+
+# intercept
+intercept = plor.table.female[-c(1:(nrow(plor.table.female)-2)),]
+# final or
+write.csv(plor.table.female, "./proportional_odds_female.csv")
+```
+
